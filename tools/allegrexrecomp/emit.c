@@ -8,6 +8,30 @@
 #include <string.h>
 #include <math.h>      /* isnan / isinf for the VFPU immediate loads */
 
+/* Spell a float as a C literal that always carries a decimal point.
+ *
+ * "%.9g" renders an integral value with neither point nor exponent -- "-2",
+ * "127", "32752" -- and a literal `f` suffix then glues itself on to make
+ * "-2f", which C lexes as a bad numeric suffix rather than as a float. The
+ * same class of bug as the `nanf` one below it, and it needs the same kind of
+ * care: the number has to be *spelled* as a float, not merely suffixed.
+ *
+ * Nine significant digits round-trip a float exactly, so appending ".0" when
+ * the rendering has no point and no exponent changes the spelling and not the
+ * value. (God of War: Ghost of Sparta, NPEG00045, emits several: -2, 127 and
+ * 32752 among them.) */
+static void float_literal(char *buf, size_t n, float v) {
+    snprintf(buf, n, "%.9g", (double)v);
+    if (!strpbrk(buf, ".eE")) {
+        size_t len = strlen(buf);
+        if (len + 3 <= n) {
+            buf[len]     = '.';
+            buf[len + 1] = '0';
+            buf[len + 2] = '\0';
+        }
+    }
+}
+
 /* Generated register names: r_a0, r_sp, ... The generated header #defines each
  * onto psp_cpu.r[N]. Naming them beats indexing because the emitted code then
  * reads like the assembly it came from. */
@@ -524,8 +548,11 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
         if (isnan(v))      fprintf(f, "%spsp_vimm(%u, NAN);\n", ind, in->vd);
         else if (isinf(v)) fprintf(f, "%spsp_vimm(%u, %sINFINITY);\n",
                                    ind, in->vd, v < 0 ? "-" : "");
-        else               fprintf(f, "%spsp_vimm(%u, %.9gf);\n",
-                                   ind, in->vd, (double)v);
+        else {
+            char lit[64];
+            float_literal(lit, sizeof lit, v);
+            fprintf(f, "%spsp_vimm(%u, %sf);\n", ind, in->vd, lit);
+        }
         return;
     }
 
@@ -636,6 +663,23 @@ static int slot_repeatable(const a_insn *s) {
 static void mark_labels(ectx *c, const a_func *fn) {
     const a_analysis *an = c->an;
     const uint32_t owner = fn->addr;
+
+    /* The entry is a label, and it has to be marked *here* rather than in
+     * emit_function, which is where the reason it needs one is spelled out.
+     *
+     * The delay-slot pass at the bottom of this function propagates a label
+     * from a slot to the address after it. When the slot *is* the entry --
+     * a function whose first instruction is the delay slot of a branch in the
+     * range below its entry point -- that pass is the only thing that gives
+     * the branch's fall-through path somewhere to land, and it cannot see a
+     * bit that emit_function sets twenty lines later. Marking it afterwards
+     * left `goto L_<entry+4>` with no label to reach, which is one compile
+     * error per site.
+     *
+     * God of War: Ghost of Sparta has two: psp_func_00016A50 and
+     * psp_func_0000858C. Both are functions that own instructions below their
+     * entry, which is the shape that makes this reachable at all. */
+    c->is_label[widx(an, fn->addr)] = 1;
 
     for (uint32_t a = fn->start; a < fn->end; a += 4) {
         if (!owned_by(an, a, owner)) continue;
