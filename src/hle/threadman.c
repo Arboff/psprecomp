@@ -1732,6 +1732,8 @@ static void hle_CreateFpl(void) {
 
     f->uid  = g_next_uid++;
     f->used = 1;
+    fprintf(stderr, "CreateFpl \"%s\" -> uid 0x%X: %u blocks of %u (stride %u) at 0x%08X\n",
+            f->name, f->uid, f->blocks, f->block_size, f->stride, f->base);
     psp_ret(f->uid);
 }
 
@@ -1799,6 +1801,8 @@ static uint32_t take_fpl_block(int blocking) {
         if (fpl_bit(f, i)) continue;
         fpl_set(f, i, 1);
         f->taken++;
+        fprintf(stderr, "AllocateFpl uid 0x%X block %u -> 0x%08X (written to 0x%08X)\n",
+                f->uid, i, f->base + i * f->stride, outp);
         psp_write32(outp, f->base + i * f->stride);
         return SCE_KERNEL_ERROR_OK;
     }
