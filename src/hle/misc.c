@@ -322,6 +322,78 @@ static void hle_UmdGetDiscInfo(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* ---- the last of one module's imports ------------------------------------
+ *
+ * These five were all that God of War: Ghost of Sparta still called and did
+ * not get an answer to. Two of them matter far more than the other three,
+ * and for the same reason sceKernelAllocateFpl did: they answer *through a
+ * pointer*, so returning zero leaves the caller reading whatever was in
+ * that memory already. A function like that cannot be stubbed by returning
+ * a value, because the value is not where the answer goes.
+ */
+
+/* The PSP lends user mode a 4 MB block of kernel RAM at 0x08400000 while it
+ * is not needed for anything else -- games use it for load-time scratch.
+ * The address and size go back through pointers, and it sits below the
+ * 0x08800000 user heap, so nothing the allocator hands out can overlap it. */
+#define PSP_VOLATILE_ADDR 0x08400000u
+#define PSP_VOLATILE_SIZE 0x00400000u
+
+static int g_volatile_locked;
+
+static void hle_VolatileMemLock(void) {
+    /* (unk, void **ptr, int *size) */
+    const uint32_t pptr = psp_arg(1), psize = psp_arg(2);
+    if (pptr)  psp_write32(pptr,  PSP_VOLATILE_ADDR);
+    if (psize) psp_write32(psize, PSP_VOLATILE_SIZE);
+    g_volatile_locked = 1;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_VolatileMemTryLock(void) {
+    /* The try form has to be able to fail, or a game that polls it to find
+     * out whether the block is already taken never learns otherwise. */
+    if (g_volatile_locked) { psp_ret(0x800200D3u); return; }   /* in use */
+    hle_VolatileMemLock();
+}
+
+static void hle_VolatileMemUnlock(void) {
+    g_volatile_locked = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* (int *language, int *buttonAssign) -- also answers through pointers.
+ * English, and cross to confirm, which is what a European or American disc
+ * expects; a Japanese one would want circle. */
+static void hle_ImposeGetLanguageMode(void) {
+    const uint32_t plang = psp_arg(0), pbtn = psp_arg(1);
+    if (plang) psp_write32(plang, 1);      /* PSP_LANGUAGE_ENGLISH */
+    if (pbtn)  psp_write32(pbtn,  1);      /* cross confirms */
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* Returns the *previous* translation size, not a status. 0x400 is the
+ * hardware default, and a game that sets it then restores it would restore
+ * zero if this answered zero. */
+static uint32_t g_edram_translation = 0x400;
+
+static void hle_GeEdramSetAddrTranslation(void) {
+    const uint32_t prev = g_edram_translation;
+    g_edram_translation = psp_arg(0);
+    psp_ret(prev);
+}
+
+/* Changing directory does not change where anything resolves here, because
+ * every path a game opens carries its device prefix and sceIo maps that to
+ * a subdirectory of the data root. Accepted so the call is not a failure;
+ * if a title ever opens a genuinely relative path this has to grow a cwd. */
+static void hle_IoChdir(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+
+/* How long the pad must be idle before the PSP dims and suspends. There is
+ * no idle timer here, so recording the request and agreeing is the whole
+ * behaviour. */
+static void hle_CtrlSetIdleCancelThreshold(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+
 void psp_misc_register(void) {
     psp_hle_register(0x092968F4, "Kernel_Library", "sceKernelCpuSuspendIntr", hle_CpuSuspendIntr);
     psp_hle_register(0x5F10D406, "Kernel_Library", "sceKernelCpuResumeIntr",  hle_CpuResumeIntr);
@@ -395,5 +467,14 @@ void psp_misc_register(void) {
      * diagnostic channel filling with calls that are not a problem. */
     psp_hle_register_unnamed(0x1B4217BC, "SysMemUserForUser", hle_ok);
     psp_hle_register_unnamed(0x469989AD, "scePower", hle_ok);
+
+    psp_hle_register(0x3E0271D3, "sceSuspendForUser", "sceKernelVolatileMemLock",    hle_VolatileMemLock);
+    psp_hle_register(0xA14F40B2, "sceSuspendForUser", "sceKernelVolatileMemTryLock", hle_VolatileMemTryLock);
+    psp_hle_register(0xA569E425, "sceSuspendForUser", "sceKernelVolatileMemUnlock",  hle_VolatileMemUnlock);
+    psp_hle_register(0x24FD7BCF, "sceImpose", "sceImposeGetLanguageMode",            hle_ImposeGetLanguageMode);
+    psp_hle_register(0xB77905EA, "sceGe_user", "sceGeEdramSetAddrTranslation",       hle_GeEdramSetAddrTranslation);
+    psp_hle_register(0x55F4717D, "IoFileMgrForUser", "sceIoChdir",                   hle_IoChdir);
+    psp_hle_register(0xA7144800, "sceCtrl", "sceCtrlSetIdleCancelThreshold",         hle_CtrlSetIdleCancelThreshold);
+
 
 }
