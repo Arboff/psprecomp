@@ -359,18 +359,32 @@ static int resolve_jump_table(a_analysis *an, uint32_t site, u32list *out) {
     if (!lw_addr) return 0;
 
     /* The lw's base is `index + tablebase`, formed by an `addu`. One operand
-     * is the scaled index (from `sll`), the other is the table address. The
-     * address itself is built as lui+addiu -- NOT as the lw's displacement,
-     * which is typically zero:
+     * is the scaled index (from `sll`), the other is the table address.
      *
+     * The address is built one of two ways, and both have to be accepted,
+     * because which one a compiler picks is not a property of the idiom:
+     *
+     *   Form A -- lui+addiu builds the whole address, lw displacement 0:
      *     lui   $t3, %hi(table)
      *     sll   $t0, $key, 2
      *     addiu $t2, $t3, %lo(table)
      *     addu  $t0, $t0, $t2
      *     lw    $rN, 0($t0)
      *
-     * An earlier attempt looked for the low half in the lw displacement, which
-     * is the other common form, and so matched nothing here. */
+     *   Form B -- the lui carries %hi and the lw displacement carries %lo:
+     *     lui   $at, %hi(table)
+     *     sll   $v1, $key, 2
+     *     addu  $at, $at, $v1
+     *     lw    $at, %lo(table)($at)
+     *
+     * Form A alone was enough for a module that never emits form B. God of
+     * War: Ghost of Sparta emits form B throughout -- 175 of its 176
+     * computed jumps are switch tables and only 35 resolved -- so requiring
+     * an addiu left about 140 real tables as dispatch misses.
+     *
+     * Accepting both is safe because the result is still verified per entry:
+     * every target must land in .text, be instruction-aligned and decode. A
+     * misidentified table fails that and is rejected wholesale. */
     uint8_t cand[2];
     int ncand = 0;
     for (int i = 1; i <= JT_WINDOW && ncand == 0; i++) {
@@ -411,6 +425,25 @@ static int resolve_jump_table(a_analysis *an, uint32_t site, u32list *out) {
                     found = 1;
                     break;
                 }
+            }
+        }
+    }
+
+    /* Form B: no addiu at all -- an operand of the addu came straight from a
+     * lui, and the low half is the lw's displacement. The displacement is
+     * signed, so a low half of 0x8000 or more borrows from the high half,
+     * which the addition below gets right because a_insn keeps imm signed. */
+    for (int k = 0; k < 2 && !found; k++) {
+        uint8_t reg = cand[k];
+        for (int i = 1; i <= JT_WINDOW && !found; i++) {
+            uint32_t a = lw_addr - (uint32_t)i * 4;
+            if (!a_in_range(an, a)) break;
+            a_insn li;
+            a_decode(fetch(an, a), a, &li);
+            if (li.op == A_LUI && li.rt == reg) {
+                table = ((uint32_t)li.imm << 16) + (uint32_t)lw.imm;
+                found = 1;
+                break;
             }
         }
     }
