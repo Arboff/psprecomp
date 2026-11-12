@@ -1014,7 +1014,30 @@ static void emit_function(ectx *c, const a_func *fn) {
              * may write that register -- `jalr $t5` / `addiu $t5,$t5,8` calls
              * the OLD $t5. Capture it first, as a branch captures `_c`. */
             if (in.is_indirect) fprintf(f, "    { uint32_t _t = %s;\n", RN[in.rs]);
-            if (have_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
+            /* A call's delay slot runs before the call transfers, whoever
+             * owns the address it sits at. When another body owns it, this
+             * body still has to emit a copy here: the walk reaches the real
+             * instruction only after the call has already returned, which is
+             * too late for a slot that was setting up an argument.
+             *
+             * The same hole `j` and `jr` had -- a transfer that leaves runs
+             * its slot even when the slot is foreign -- closed for those two
+             * and not for calls.
+             *
+             * God of War: Ghost of Sparta is where it shows. At 0x0000006C:
+             *
+             *     0000006C  jal  0x00003A70        ; operator new
+             *     00000070  ori  $a0, $zero, 0x2BC ; 700 bytes, the argument
+             *
+             * 0x00000070 is also a discovered function entry, so the slot is
+             * foreign and was not emitted. malloc ran with a stale $a0 and
+             * failed; the constructor it was allocating for was skipped; the
+             * global that constructor would have set stayed null; and a later
+             * path dereferenced the null. Because the module is linked at
+             * address 0 that dereference succeeded and returned the module's
+             * own first instruction word, so it presented as code used as a
+             * pointer, four call levels away from the cause. */
+            if (have_slot || taken_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
             /* Set $ra.
              *
              * Recompiled calls are C calls and `jr $ra` is emitted as `return`,

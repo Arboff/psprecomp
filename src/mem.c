@@ -15,15 +15,29 @@ uint64_t   psp_mem_bad_access;
  * path is the one place that can answer it directly. */
 static uint32_t g_wwatch;
 static int g_whits;
+static int g_wlimit = 8;
+
+/* How many hits to print. Eight is enough to see who first sets a global;
+ * a global that is set and cleared repeatedly -- a scoped `current heap`,
+ * say -- needs the whole sequence before the pattern is visible. */
+void psp_mem_watch_write_limit(int n) { g_wlimit = n > 0 ? n : 8; }
+
 void psp_mem_watch_write(uint32_t addr) { g_wwatch = addr; g_whits = 0; }
 int psp_mem_watch_hits(void) { return g_whits; }
 
-static void note_write(uint32_t addr, uint32_t width) {
+/* The value is what a watch is usually for: a global that is set once and
+ * still reads as zero was set *to* zero, which is a different bug from
+ * never having been set at all. Called after the store, so this reads
+ * what the guest will see. */
+static void note_write(uint32_t addr, uint32_t width, const void *at) {
     if (!g_wwatch || addr + width <= g_wwatch || addr > g_wwatch) return;
-    if (g_whits++ < 8)
+    if (g_whits++ < g_wlimit)
     {
-        fprintf(stderr, "write%u to 0x%08X (watch 0x%08X) from fn 0x%08X ra 0x%08X calls",
-                width * 8, addr, g_wwatch, psp_trace_last(), psp_cpu.r[PSP_REG_RA]);
+        uint32_t v = 0;
+        memcpy(&v, at, width > 4 ? 4 : width);
+        fprintf(stderr, "write%u of 0x%08X to 0x%08X (watch 0x%08X) from fn 0x%08X ra 0x%08X calls",
+                width * 8, v, addr, g_wwatch, psp_trace_last(),
+                psp_cpu.r[PSP_REG_RA]);
         /* The return sites of the guest calls in flight, innermost first:
          * the writer is the body that called the first of them. */
         for (const psp_frame *f = psp_cpu.frame; f && f->ret; f = f->prev)
@@ -157,8 +171,8 @@ float    psp_read_f32(uint32_t addr) { READ_BODY(float)  }
 #define WRITE_BODY(TYPE)                             \
     void *p = psp_mem_ptr(addr, (uint32_t)sizeof(TYPE)); \
     if (!p) { bad_access(addr, 1, (int)sizeof(TYPE)); return; }         \
-    note_write(addr, (uint32_t)sizeof(TYPE));                    \
-    memcpy(p, &val, sizeof(TYPE));
+    memcpy(p, &val, sizeof(TYPE));                               \
+    note_write(addr, (uint32_t)sizeof(TYPE), p);
 
 void psp_write8 (uint32_t addr, uint8_t  val) { WRITE_BODY(uint8_t)  }
 void psp_write16(uint32_t addr, uint16_t val) { WRITE_BODY(uint16_t) }
