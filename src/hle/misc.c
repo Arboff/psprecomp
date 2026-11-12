@@ -263,6 +263,65 @@ void psp_misc_reset(void) {
 
 void psp_misc_init(void) { psp_misc_reset(); }
 
+/* ---- the UMD drive -------------------------------------------------------
+ *
+ * A game cannot read its own data until it has asked whether there is a
+ * disc in the drive and been told yes. God of War: Ghost of Sparta polls
+ * sceUmdCheckMedium in a loop before it does anything else, so with that
+ * call unimplemented and returning zero -- which here means "no disc" -- it
+ * span forever waiting for a drive that was never going to answer.
+ *
+ * There is always a disc, because the data is a host directory that either
+ * exists or does not. So the drive reports present, inited, ready and
+ * readable, and the waits return at once rather than parking a thread that
+ * nothing would ever wake.
+ */
+#define PSP_UMD_NOT_PRESENT 0x01
+#define PSP_UMD_PRESENT     0x02
+#define PSP_UMD_INITING     0x04
+#define PSP_UMD_INITED      0x08
+#define PSP_UMD_READY       0x10
+#define PSP_UMD_READABLE    0x20
+
+#define UMD_STAT (PSP_UMD_PRESENT | PSP_UMD_INITED | \
+                  PSP_UMD_READY   | PSP_UMD_READABLE)
+
+static uint32_t g_umd_callback;
+
+/* 1 is "a disc is in the drive". Zero is the answer that makes a game wait. */
+static void hle_UmdCheckMedium(void)  { psp_ret(1); }
+static void hle_UmdGetDriveStat(void) { psp_ret(UMD_STAT); }
+
+/* Activate assigns the drive to a block device -- disc0: -- which sceIo
+ * already maps to a subdirectory of the data root, so there is nothing to
+ * mount and nothing to fail. */
+static void hle_UmdActivate(void)   { psp_ret(SCE_KERNEL_ERROR_OK); }
+static void hle_UmdDeactivate(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+
+/* The waits are already satisfied: whatever status is being waited for, the
+ * drive is in it. Parking the caller instead would hang it, because no
+ * media event is ever going to arrive. */
+static void hle_UmdWaitDriveStat(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+
+static void hle_UmdRegisterCallback(void) {
+    g_umd_callback = psp_arg(0);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_UmdUnregisterCallback(void) {
+    g_umd_callback = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_UmdGetDiscInfo(void) {
+    /* (SceUmdDiscInfo *) -- size, then the medium type. The first field is
+     * the caller's own struct size and is left alone. */
+    const uint32_t info = psp_arg(0);
+    if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+    psp_write32(info + 4, 0x10);            /* a game disc */
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
 void psp_misc_register(void) {
     psp_hle_register(0x092968F4, "Kernel_Library", "sceKernelCpuSuspendIntr", hle_CpuSuspendIntr);
     psp_hle_register(0x5F10D406, "Kernel_Library", "sceKernelCpuResumeIntr",  hle_CpuResumeIntr);
@@ -310,4 +369,31 @@ void psp_misc_register(void) {
     psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_SetChannelDataLen);
     psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ok);
     psp_hle_register(0xB7E1D8E7, "sceAudio", "sceAudioChangeChannelVolume",  hle_ok);
+
+    psp_hle_register(0x46EBB729, "sceUmdUser", "sceUmdCheckMedium",            hle_UmdCheckMedium);
+    psp_hle_register(0x6B4A146C, "sceUmdUser", "sceUmdGetDriveStat",           hle_UmdGetDriveStat);
+    psp_hle_register(0xC6183D47, "sceUmdUser", "sceUmdActivate",               hle_UmdActivate);
+    psp_hle_register(0xE83742BA, "sceUmdUser", "sceUmdDeactivate",             hle_UmdDeactivate);
+    psp_hle_register(0x8EF08FCE, "sceUmdUser", "sceUmdWaitDriveStat",          hle_UmdWaitDriveStat);
+    psp_hle_register(0x4A9E5E29, "sceUmdUser", "sceUmdWaitDriveStatCB",        hle_UmdWaitDriveStat);
+    psp_hle_register(0x56202973, "sceUmdUser", "sceUmdWaitDriveStatWithTimer", hle_UmdWaitDriveStat);
+    psp_hle_register(0xAEE7404D, "sceUmdUser", "sceUmdRegisterUMDCallBack",    hle_UmdRegisterCallback);
+    psp_hle_register(0xBD2BDE07, "sceUmdUser", "sceUmdUnRegisterUMDCallBack",  hle_UmdUnregisterCallback);
+    psp_hle_register(0x340B7686, "sceUmdUser", "sceUmdGetDiscInfo",            hle_UmdGetDiscInfo);
+    psp_hle_register(0xCBE9F02A, "sceUmdUser", "sceUmdReplacePermit",          hle_ok);
+    psp_hle_register(0x87533940, "sceUmdUser", "sceUmdReplaceProhibit",        hle_ok);
+
+    /* Two NIDs this game imports whose names are genuinely not recovered.
+     * A NID is SHA-1(name)[0:4] little-endian, so a name is either right or
+     * it is not; the obvious spellings were tried against both and none
+     * hash to these, so they go in unnamed rather than mislabelled.
+     *
+     * Both are called once during startup and both are harmless as a
+     * success: the SysMem one sits where the compiled-SDK-version setters
+     * sit and the game ignores the result, and the scePower one is called
+     * beside its callback registration. Registering them stops a real
+     * diagnostic channel filling with calls that are not a problem. */
+    psp_hle_register_unnamed(0x1B4217BC, "SysMemUserForUser", hle_ok);
+    psp_hle_register_unnamed(0x469989AD, "scePower", hle_ok);
+
 }
