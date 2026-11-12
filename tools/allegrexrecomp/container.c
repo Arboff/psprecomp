@@ -512,6 +512,44 @@ static int looks_like_code(const uint8_t *d, size_t len, const elf_info *e,
     return 1;
 }
 
+/* PSP PRX relocations are segment-relative, not module-relative.
+ *
+ * r_info packs three bytes rather than the usual symbol index:
+ *
+ *   bits  0..7   relocation type
+ *   bits  8..15  index of the PT_LOAD segment r_offset is measured from
+ *   bits 16..23  index of the segment the relocated address is measured from
+ *
+ * Treating r_offset as a module-relative address with one bias is right only
+ * while everything lives in segment 0, which is why it held for a
+ * single-segment module. God of War: Ghost of Sparta keeps .cplinit -- its
+ * C++ constructor table -- along with .linkonce.d and
+ * .psp_lib_markimport_ in segment 1, and the two segments do not even share
+ * a file-offset delta (116 against 112). 4058 relocations were read from the
+ * wrong words, the 183 constructor pointers among them.
+ *
+ * The reference segment matters just as much: .rel.text holds 18474
+ * HI16/LO16 pairs that name segment 1, and computing those without its base
+ * leaves an address short by 0x0043A4F8 -- which lands back inside .text and
+ * seeds a function that is not there. */
+#define RELOC_TYPE(info)    ((info) & 0xFFu)
+#define RELOC_OFS_SEG(info) (((info) >> 8) & 0xFFu)
+#define RELOC_REF_SEG(info) (((info) >> 16) & 0xFFu)
+
+/* File offset of the word a relocation patches, or (size_t)-1 if the segment
+ * is not one we loaded or the offset falls outside its file-backed part. */
+static size_t reloc_file_at(const elf_info *e, uint32_t r_offset, uint32_t seg) {
+    if (seg >= (uint32_t)e->nsegments) return (size_t)-1;
+    if (r_offset > e->seg[seg].filesz) return (size_t)-1;
+    return (size_t)e->seg[seg].offset + r_offset;
+}
+
+/* Base address the relocated value is measured from. */
+static uint32_t reloc_ref_base(const elf_info *e, uint32_t seg) {
+    if (seg >= (uint32_t)e->nsegments) return 0;
+    return e->seg[seg].addr;
+}
+
 int psp_collect_pointer_seeds(const uint8_t *d, size_t len, const elf_info *e,
                               uint32_t load_bias, uint32_t *out, int max) {
     if (!e->shoff || !e->shnum || !e->text_size) return 0;
@@ -552,16 +590,18 @@ int psp_collect_pointer_seeds(const uint8_t *d, size_t len, const elf_info *e,
              * pairs, and the address is (hi << 16) + (int16)lo. The LO16 half
              * is signed, which is why it cannot simply be OR'd in: a low half
              * of 0x8000 or above borrows from the high half. */
-            if ((r_info & 0xFF) == R_MIPS_HI16 && r + 16 <= size) {
+            if (RELOC_TYPE(r_info) == R_MIPS_HI16 && r + 16 <= size) {
                 uint32_t lo_info = rd32(d + off + r + 12);
-                if ((lo_info & 0xFF) == R_MIPS_LO16) {
+                if (RELOC_TYPE(lo_info) == R_MIPS_LO16) {
                     uint32_t lo_offset = rd32(d + off + r + 8);
-                    size_t hi_at = (uint32_t)(r_offset + load_bias);
-                    size_t lo_at = (uint32_t)(lo_offset + load_bias);
-                    if (hi_at + 4 <= len && lo_at + 4 <= len) {
+                    size_t hi_at = reloc_file_at(e, r_offset, RELOC_OFS_SEG(r_info));
+                    size_t lo_at = reloc_file_at(e, lo_offset, RELOC_OFS_SEG(lo_info));
+                    if (hi_at != (size_t)-1 && lo_at != (size_t)-1 &&
+                        hi_at + 4 <= len && lo_at + 4 <= len) {
                         uint32_t hi_imm = rd32(d + hi_at) & 0xFFFF;
                         int32_t  lo_imm = (int16_t)(rd32(d + lo_at) & 0xFFFF);
-                        uint32_t target = (hi_imm << 16) + (uint32_t)lo_imm;
+                        uint32_t target = (hi_imm << 16) + (uint32_t)lo_imm
+                                        + reloc_ref_base(e, RELOC_REF_SEG(r_info));
                         if (target >= text_lo && target < text_hi && !(target & 3)) {
                             if (found < max) out[found] = target;
                             found++;
@@ -571,15 +611,15 @@ int psp_collect_pointer_seeds(const uint8_t *d, size_t len, const elf_info *e,
                 continue;
             }
 
-            if ((r_info & 0xFF) != R_MIPS_32) continue;
+            if (RELOC_TYPE(r_info) != R_MIPS_32) continue;
 
             /* The relocated word holds the address. A PRX links at zero, so
              * the stored value is already the module-relative address and
              * needs no fixing up — only reading. */
-            size_t at = (uint32_t)(r_offset + load_bias);
-            if (at + 4 > len) continue;
+            size_t at = reloc_file_at(e, r_offset, RELOC_OFS_SEG(r_info));
+            if (at == (size_t)-1 || at + 4 > len) continue;
 
-            uint32_t target = rd32(d + at);
+            uint32_t target = rd32(d + at) + reloc_ref_base(e, RELOC_REF_SEG(r_info));
             if (target & 3) continue;            /* not instruction-aligned */
             if (!looks_like_code(d, len, e, load_bias, target, text_lo, text_hi))
                 continue;

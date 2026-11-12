@@ -16,6 +16,7 @@ typedef struct {
     uint32_t gp;            /* from the module info */
     uint32_t ctors;         /* constructor table, 0 if none was found */
     int      nctors;
+    uint32_t ctors_stride;  /* bytes between entries: 4, or 8 for .cplinit */
 } psp_module;
 
 /* Map `span` bytes at the module's link address, copy its PT_LOAD segment in,

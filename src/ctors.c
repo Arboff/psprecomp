@@ -73,9 +73,12 @@ int psp_ctors_find(uint32_t lo, uint32_t hi, uint32_t code_lo, uint32_t code_hi,
     return 0;
 }
 
-int psp_ctors_run(uint32_t table) {
+int psp_ctors_run(uint32_t table) { return psp_ctors_run_strided(table, 4); }
+
+int psp_ctors_run_strided(uint32_t table, uint32_t stride) {
     int n = 0;
-    for (uint32_t p = table; ; p += 4) {
+    if (stride < 4) stride = 4;
+    for (uint32_t p = table; ; p += stride) {
         uint32_t fn = psp_read32(p);
         if (!fn) break;
         /* Each constructor is an ordinary call with no arguments. $ra is set
