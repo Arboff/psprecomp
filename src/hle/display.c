@@ -115,9 +115,51 @@ static void hle_WaitVblank(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* The queries. Each of these answers *through a pointer*, so leaving them
+ * unimplemented does not merely return a wrong value -- it leaves the
+ * caller reading whatever was in its own output variables, which is how a
+ * framebuffer address or a screen size becomes a stack leftover. */
+static void hle_GetFrameBuf(void) {
+    /* (void **topaddr, int *bufferwidth, int *pixelformat, int sync) */
+    const uint32_t pa = psp_arg(0), pw = psp_arg(1), pf = psp_arg(2);
+    if (pa) psp_write32(pa, g_fb_addr);
+    if (pw) psp_write32(pw, g_fb_width);
+    if (pf) psp_write32(pf, g_fb_format);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_GetMode(void) {
+    /* (int *mode, int *width, int *height) */
+    const uint32_t pm = psp_arg(0), pw = psp_arg(1), ph = psp_arg(2);
+    if (pm) psp_write32(pm, g_mode);
+    if (pw) psp_write32(pw, g_mode_w);
+    if (ph) psp_write32(ph, g_mode_h);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* The vertical counter. A game that paces itself on this rather than on
+ * sceDisplayWaitVblankStart needs it to actually advance, or it spins. */
+static void hle_GetVcount(void) { psp_ret((uint32_t)g_vblank_count); }
+
+/* There is no scanout, so there is no blanking interval to be inside. */
+static void hle_IsVblank(void)  { psp_ret(0); }
+static void hle_GetHcount(void) { psp_ret(0); }
+
 void psp_display_register(void) {
     psp_hle_register(0x0E20F177, "sceDisplay", "sceDisplaySetMode",           hle_SetMode);
     psp_hle_register(0x289D82FE, "sceDisplay", "sceDisplaySetFrameBuf",       hle_SetFrameBuf);
     psp_hle_register(0x36CDFADE, "sceDisplay", "sceDisplayWaitVblank",        hle_WaitVblank);
     psp_hle_register(0x46F186C3, "sceDisplay", "sceDisplayWaitVblankStartCB", hle_WaitVblank);
+
+    /* The one every PSP game calls once a frame. The handler was already
+     * here; only this registration was missing, so the call that paces the
+     * whole game was going unanswered while its CB form was answered. */
+    psp_hle_register(0x984C27E7, "sceDisplay", "sceDisplayWaitVblankStart",  hle_WaitVblank);
+    psp_hle_register(0x8EB9EC49, "sceDisplay", "sceDisplayWaitVblankCB",     hle_WaitVblank);
+    psp_hle_register(0x9C6EAAD7, "sceDisplay", "sceDisplayGetVcount",        hle_GetVcount);
+    psp_hle_register(0xEEDA2E54, "sceDisplay", "sceDisplayGetFrameBuf",      hle_GetFrameBuf);
+    psp_hle_register(0xDEA197D4, "sceDisplay", "sceDisplayGetMode",          hle_GetMode);
+    psp_hle_register(0x4D4E10EC, "sceDisplay", "sceDisplayIsVblank",         hle_IsVblank);
+    psp_hle_register(0x773DD3A3, "sceDisplay", "sceDisplayGetCurrentHcount", hle_GetHcount);
+
 }
