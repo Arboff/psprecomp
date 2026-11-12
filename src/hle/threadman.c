@@ -93,7 +93,7 @@ enum { TH_DORMANT = 0, TH_READY, TH_RUNNING, TH_SUSPENDED };
 
 /* What a parked thread is waiting for. A wake is targeted: signalling a
  * semaphore should not wake a thread waiting on a thread to exit. */
-enum { W_NONE = 0, W_SLEEP, W_DELAY, W_SEMA, W_FLAG, W_THREAD_END, W_VPL };
+enum { W_NONE = 0, W_SLEEP, W_DELAY, W_SEMA, W_FLAG, W_THREAD_END, W_VPL, W_FPL };
 
 static const char *wait_name(int w) {
     switch (w) {
@@ -103,6 +103,7 @@ static const char *wait_name(int w) {
     case W_FLAG:       return "event flag";
     case W_THREAD_END: return "thread end";
     case W_VPL:        return "vpl";
+    case W_FPL:        return "fpl";
     default:           return "-";
     }
 }
@@ -225,6 +226,30 @@ static uint64_t     g_cb_deliver_deferred;  /* passes that hit the per-tick ceil
 static int          g_cb_delivering;        /* re-entrance guard, see deliver_callbacks */
 static psp_vpl       g_vpl[MAX_VPLS];
 static psp_vpl_block g_vplblk[MAX_VPL_BLOCKS];
+
+/* Fixed-size pools. Unlike a VPL, an FPL is a real arena: the game asks for
+ * `blocks` blocks of `block_size` once, and every block it is handed comes
+ * from inside that one allocation at a fixed stride. So the pool is backed
+ * for real rather than merely accounted for, and which blocks are out is a
+ * bitmap rather than a list of addresses. */
+#define MAX_FPLS       64
+#define MAX_FPL_BLOCKS 2048
+
+typedef struct {
+    int      used;
+    uint32_t uid;
+    char     name[32];
+    uint32_t attr;
+    uint32_t block_size;   /* as the game asked for */
+    uint32_t stride;       /* rounded up, so every block stays 8-aligned */
+    uint32_t blocks;
+    uint32_t base;         /* the arena, from psp_sysmem_alloc */
+    uint32_t taken;        /* how many are out right now */
+    uint8_t  inuse[MAX_FPL_BLOCKS / 8];
+} psp_fpl;
+
+static psp_fpl g_fpl[MAX_FPLS];
+
 static uint32_t     g_next_uid;
 static psp_thread  *g_current;      /* whose registers are in psp_cpu, or NULL */
 /* The host thread's own record. It has to be separate from g_current: the
@@ -544,6 +569,10 @@ void psp_threadman_reset(void) {
     g_cb_delivering = 0;
     memset(g_vpl, 0, sizeof g_vpl);
     memset(g_vplblk, 0, sizeof g_vplblk);
+    for (int i = 0; i < MAX_FPLS; i++)
+        if (g_fpl[i].used && g_fpl[i].base) psp_sysmem_release(g_fpl[i].base);
+    memset(g_fpl, 0, sizeof g_fpl);
+
     g_next_uid = UID_BASE;
     g_switches = 0;
     g_parks = 0;
@@ -1638,6 +1667,166 @@ uint64_t psp_threadman_callback_deferred(void) { return g_cb_deliver_deferred; }
 uint64_t psp_threadman_created(void) { return g_created; }
 uint64_t psp_threadman_started(void) { return g_started; }
 
+/* ---- fixed-size pools ----------------------------------------------------
+ *
+ * God of War: Ghost of Sparta is what put this here, and it failed in
+ * exactly the way the VPL comment above describes. It calls
+ * `sceKernelAllocateFpl(uid, &block, NULL)` and reads `block` on the very
+ * next instruction:
+ *
+ *     00004324  or   $a1, $s0, $zero      ; &block
+ *     00004328  jal  0x003F46EC           ; sceKernelAllocateFpl
+ *     0000432C  or   $a2, $zero, $zero    ; timeout = NULL
+ *     00004334  lw   $v0, 0($s0)          ; reads what the call should write
+ *
+ * Unimplemented, the call returned zero and wrote nothing, so the game read
+ * back whatever the stack happened to hold -- 0x00808025, an instruction
+ * word -- and called it. A function that answers through a pointer cannot
+ * be stubbed by returning a value, because the value is not where the
+ * answer goes. */
+static psp_fpl *find_fpl(uint32_t id) {
+    for (int i = 0; i < MAX_FPLS; i++)
+        if (g_fpl[i].used && g_fpl[i].uid == id) return &g_fpl[i];
+    return NULL;
+}
+
+static int fpl_bit(const psp_fpl *f, uint32_t i) {
+    return (f->inuse[i >> 3] >> (i & 7)) & 1;
+}
+
+static void fpl_set(psp_fpl *f, uint32_t i, int on) {
+    if (on) f->inuse[i >> 3] |=  (uint8_t)(1u << (i & 7));
+    else    f->inuse[i >> 3] &= (uint8_t)~(1u << (i & 7));
+}
+
+static void hle_CreateFpl(void) {
+    /* (name, partitionid, attr, blocksize, numblocks, option) */
+    const uint32_t block_size = psp_arg(3);
+    const uint32_t blocks     = psp_arg(4);
+    if (!block_size || !blocks) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT);
+        return;
+    }
+    if (blocks > MAX_FPL_BLOCKS) {
+        /* Say so rather than quietly serving a smaller pool: the game sized
+         * it for a reason and would meet the shortfall far from here. */
+        fprintf(stderr, "sceKernelCreateFpl: %u blocks exceeds MAX_FPL_BLOCKS (%u)\n",
+                blocks, (unsigned)MAX_FPL_BLOCKS);
+        psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
+        return;
+    }
+
+    psp_fpl *f = NULL;
+    for (int i = 0; i < MAX_FPLS; i++) if (!g_fpl[i].used) { f = &g_fpl[i]; break; }
+    if (!f) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+
+    memset(f, 0, sizeof *f);
+    psp_str(psp_arg(0), f->name, sizeof f->name);
+    f->attr       = psp_arg(2);
+    f->block_size = block_size;
+    f->stride     = (block_size + 7u) & ~7u;
+    f->blocks     = blocks;
+
+    f->base = psp_sysmem_alloc(f->stride * blocks, 0);
+    if (!f->base) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+
+    f->uid  = g_next_uid++;
+    f->used = 1;
+    psp_ret(f->uid);
+}
+
+static void hle_DeleteFpl(void) {
+    psp_fpl *f = find_fpl(psp_arg(0));
+    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    if (f->base) psp_sysmem_release(f->base);
+    f->used = 0;
+    wake_waiters(W_FPL);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_FreeFpl(void) {
+    /* (fplid, dataptr) */
+    psp_fpl *f = find_fpl(psp_arg(0));
+    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    const uint32_t addr = psp_arg(1);
+    if (addr < f->base) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK); return; }
+
+    const uint32_t off = addr - f->base;
+    const uint32_t i   = off / f->stride;
+    /* It has to be the start of a block this pool owns, and one that is
+     * actually out: a double free accounted as a free would hand the same
+     * block to two callers later on. */
+    if (off % f->stride || i >= f->blocks || !fpl_bit(f, i)) {
+        psp_ret(SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK);
+        return;
+    }
+    fpl_set(f, i, 0);
+    f->taken--;
+    wake_waiters(W_FPL);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+struct fpl_ctx { psp_fpl *f; };
+static int fpl_room(void *p) {
+    struct fpl_ctx *c = (struct fpl_ctx *)p;
+    return c->f->taken < c->f->blocks;
+}
+
+static uint32_t take_fpl_block(int blocking) {
+    /* (fplid, void **data, unsigned *timeout) -- the timeout is a pointer,
+     * as the firmware declares it, and a null one means wait. */
+    psp_fpl *f = find_fpl(psp_arg(0));
+    if (!f) return SCE_KERNEL_ERROR_UNKNOWN_UID;
+
+    const uint32_t outp = psp_arg(1);
+    const uint32_t tptr = psp_arg(2);
+    const uint32_t timeout = tptr ? psp_read32(tptr) : 0;
+    if (!outp) return SCE_KERNEL_ERROR_ILLEGAL_ADDR;
+
+    struct fpl_ctx c = { f };
+    if (blocking) {
+        uint32_t rc = wait_loop(fpl_room, &c, timeout, W_FPL,
+                                "sceKernelAllocateFpl", f->name);
+        if (rc != SCE_KERNEL_ERROR_OK) return rc;
+        /* Parked threads run other code, which can delete the pool. */
+        f = find_fpl(psp_arg(0));
+        if (!f) return SCE_KERNEL_ERROR_UNKNOWN_UID;
+    } else if (!fpl_room(&c)) {
+        return SCE_KERNEL_ERROR_WAIT_TIMEOUT;   /* try never blocks */
+    }
+
+    for (uint32_t i = 0; i < f->blocks; i++) {
+        if (fpl_bit(f, i)) continue;
+        fpl_set(f, i, 1);
+        f->taken++;
+        psp_write32(outp, f->base + i * f->stride);
+        return SCE_KERNEL_ERROR_OK;
+    }
+    return SCE_KERNEL_ERROR_NO_MEMORY;     /* fpl_room said otherwise */
+}
+
+static void hle_AllocateFpl(void)    { psp_ret(take_fpl_block(1)); }
+static void hle_TryAllocateFpl(void) { psp_ret(take_fpl_block(0)); }
+
+static void hle_ReferFplStatus(void) {
+    /* (fplid, SceKernelFplInfo *) -- size, name[32], attr, blockSize,
+     * numBlocks, freeBlocks, numWaitThreads. The first field is the
+     * caller's own struct size and is left alone, as the kernel leaves it. */
+    psp_fpl *f = find_fpl(psp_arg(0));
+    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    const uint32_t info = psp_arg(1);
+    if (!info) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
+
+    for (int i = 0; i < 32; i++)
+        psp_write8(info + 4 + (uint32_t)i, (uint8_t)f->name[i]);
+    psp_write32(info + 36, f->attr);
+    psp_write32(info + 40, f->block_size);
+    psp_write32(info + 44, f->blocks);
+    psp_write32(info + 48, f->blocks - f->taken);
+    psp_write32(info + 52, 0);              /* threads waiting on this pool */
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
 void psp_threadman_register(void) {
     /* NIDs are SHA-1(name)[0:4] little-endian; tests/test_hle.c verifies every
      * pair below. */
@@ -1689,6 +1878,14 @@ void psp_threadman_register(void) {
     psp_hle_register(0xB736E9FF, "ThreadManForUser", "sceKernelFreeVpl",                 hle_FreeVpl);
     psp_hle_register(0x39810265, "ThreadManForUser", "sceKernelReferVplStatus",          hle_ReferVplStatus);
     psp_hle_register(0x1D371B8A, "ThreadManForUser", "sceKernelCancelVpl",               hle_CancelVpl);
+    psp_hle_register(0xC07BB470, "ThreadManForUser", "sceKernelCreateFpl",               hle_CreateFpl);
+    psp_hle_register(0xED1410E0, "ThreadManForUser", "sceKernelDeleteFpl",               hle_DeleteFpl);
+    psp_hle_register(0xD979E9BF, "ThreadManForUser", "sceKernelAllocateFpl",             hle_AllocateFpl);
+    psp_hle_register(0xE7282CB6, "ThreadManForUser", "sceKernelAllocateFplCB",           hle_AllocateFpl);
+    psp_hle_register(0x623AE665, "ThreadManForUser", "sceKernelTryAllocateFpl",          hle_TryAllocateFpl);
+    psp_hle_register(0xF6414A71, "ThreadManForUser", "sceKernelFreeFpl",                 hle_FreeFpl);
+    psp_hle_register(0xD8199E4C, "ThreadManForUser", "sceKernelReferFplStatus",          hle_ReferFplStatus);
+
 
     psp_hle_register(0xE81CAF8F, "ThreadManForUser", "sceKernelCreateCallback",          hle_CreateCallback);
     psp_hle_register(0xEDBA5844, "ThreadManForUser", "sceKernelDeleteCallback",          hle_DeleteCallback);

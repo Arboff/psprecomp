@@ -102,10 +102,17 @@ int psp_module_load(const char *path, uint32_t span, psp_module *m) {
     /* A decrypted PRX is an ELF whose PT_LOAD segments hold the image. The
      * first one's p_paddr is not a physical address: it carries the file
      * offset of the module info. */
-    const uint32_t phoff     = rd32(b + 28);
-    const uint16_t phentsize = rd16(b + 42);
-    const uint16_t phnum     = rd16(b + 44);
-    if (memcmp(b, "\x7F" "ELF", 4) != 0 || phentsize < 32 || phnum == 0 ||
+    const uint32_t phoff = rd32(b + 28);
+    uint16_t phentsize = rd16(b + 42);
+    uint16_t phnum     = rd16(b + 44);
+    /* A hand-built minimal ELF may leave e_phentsize and e_phnum zero
+     * and simply put one program header at e_phoff. That is what the old
+     * single-segment path effectively assumed, and what
+     * tests/test_module.c writes, so take it rather than refuse the
+     * file. */
+    if (phentsize == 0) phentsize = 32;
+    if (phnum == 0)     phnum = 1;
+    if (memcmp(b, "\x7F" "ELF", 4) != 0 || phentsize < 32 ||
         (size_t)phoff + (size_t)phentsize * phnum > (size_t)n) {
         free(b);
         fprintf(stderr, "psprecomp: %s is not a decrypted ELF module\n", path);
